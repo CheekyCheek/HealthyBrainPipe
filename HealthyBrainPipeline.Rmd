@@ -1,0 +1,355 @@
+---
+title: "Healthy Brains Analysis Pipeline"
+author: "Connor Cheek"
+date: "6/3/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This R Markdown document will serve as a pipeline for the healthy brains data analysis.
+
+Data should already be annotated using Annovar prior to being loaded to this document.
+
+## Format the data
+# Ensure the elements of the genetic data are correctly formatted, and that the genetic data has been properly QC'd.
+# Ensure imaging data has been properly QC'd
+# Ensure clinical data is properly QC'd
+# Merge the three datasets into one master file for analysis
+
+Read in the behavioral and genetic data, ensure everything is formatted properly
+```{r}
+library(readr)
+library(stats)
+library(knitr)
+library(stringr)
+#read in the genetics data
+input <- read_csv("Haskins_GABA_HumanCoreExome_Batch1.csv")
+#format into additive model
+input <- data.frame(lapply(input, function(x) {gsub("A/A", 0, x) }))
+input <- data.frame(lapply(input, function(x) {gsub("A/B", 1, x) }))
+input <- data.frame(lapply(input, function(x) {gsub("B/B", 2, x) }))
+input <- data.frame(lapply(input, function(x) {gsub("-/-", NA, x) }))
+#fix names
+input$Columns<-str_sub(input$Columns, start = -4)
+rownames(input)<-input[[1]]
+input<-input[-1]
+
+gene_start<-(which(names(input)=="GORTVerifiedOralReadingQuotient")+1)
+behavior_start<-which(names(input)=="Age")
+behavior_end<-which(names(input)=="GORTVerifiedOralReadingQuotient")
+gene_end<-ncol(input)
+
+#Fix the values in the matrix
+input$Age<-as.integer(input$Age)
+input$Sex<-as.factor(input$Sex)
+input[behavior_start:gene_end]<-lapply(input[behavior_start:gene_end],as.numeric)
+
+#separate the input data into the behavior set and the genetics set
+behavior<-input[which(names(input)=="Age"):which(names(input)=="GORTVerifiedOralReadingQuotient")]
+
+genetics<-data.frame(input[(which(names(input)=="GORTVerifiedOralReadingQuotient")+1):ncol(input)])
+#format into additive model
+genetics <- data.frame(lapply(genetics, function(x) {gsub("A/A", 0, x) }))
+genetics <- data.frame(lapply(genetics, function(x) {gsub("A/B", 1, x) }))
+genetics <- data.frame(lapply(genetics, function(x) {gsub("B/B", 2, x) }))
+genetics <- data.frame(lapply(genetics, function(x) {gsub("-/-", NA, x) }))
+
+```
+
+Generate simulated MRI data, since my laptop won't handle Freesurfer
+
+```{r, include=FALSE}
+library(rsurfer)
+mri_data <- generaterandomsubjects(nrow(input)) 
+```
+
+```{r}
+library(mice)
+
+#The behavioral data has missing values in it, so we should impute these values to make sure we don't lose any data. 
+temp_behavior <- mice(behavior,m=5,maxit=50,meth='pmm',seed=500,print = F)
+behavior_complete<- complete(temp_behavior,1)
+
+```
+## Analyze the data
+# Perform necessary data reduction on the imaging data
+# Voxels lumped into ROI, PCA Performed on these voels to extract the most variance
+# Regress these PC on the clinical data to identify significant voxels
+
+```{R}
+#The mri data is already lumped into ROI for the simulated data so that doesn't need to be done yet
+#regress the mri data with the behavioral data
+#model should be score ~ SNP
+SNP_list<-names(genetics)
+assess_list<-names(behavior[17:23])
+roi_list<-names(mri_data)
+
+brain_behavior<-cbind(mri_data,behavior_complete)
+
+#make a dataframe to hold the pvalues
+mri_stats<-data.frame(matrix(NA,ncol = length(assess_list),nrow = length(roi_list)))
+names(mri_stats)<-assess_list
+rownames(mri_stats)<-roi_list
+ptm <- proc.time() 
+for(i in 1:length(assess_list)){
+  for(j in 1:length(roi_list)){
+    model<-lm(reformulate(termlabels = paste(roi_list[j],"+Age+Sex",sep = ""),response =
+                            assess_list[i]),data = brain_behavior)
+    mri_stats[j,i]<-summary(model)$coefficients[2,4] 
+  }
+  mri_stats[i]<-p.adjust(mri_stats[[i]], method = "fdr")
+} 
+proc.time() - ptm
+
+#average the pvalues for each roi
+mri_stats$AveragePvalues<-rowMeans(mri_stats)
+#select the significant averages
+significant_roi<-subset(mri_stats,AveragePvalues >=0.95)
+
+#remove the insignificant brain locations from the mri_dataset to create a final mri set for regression
+mri_data_final<-mri_data[names(mri_data) %in% rownames(significant_roi)]
+
+```
+## option 1
+# Regress SNPs gene-by-gene on the significant image voxels
+# Group SNPs by gene, regress that gene's SNPs on the sig. image voxel
+# Multiple test corrections and k-fold cross validation show model performance
+
+## Option 2
+# window based approach 
+# Mass univariate GWAS performed to ID loosely significant SNPS, all SNPs within a window of these loosely sig. SNPs included for analysis
+# Multiple test corrections and k-fold cross validation show model performance
+
+## Analyze results
+# Cross reference the discovered genes with known genes for SRD. 
+# Investigate new discoveries for association with SRD
+```{r}
+#new_mri_sample <- as.data.frame(read_csv("new_mri_sample.csv"))
+#rownames(new_mri_sample)<-new_mri_sample[[1]]
+#new_mri_sample<-new_mri_sample[-1]
+#https://stackoverflow.com/questions/22670541/subsetting-a-matrix-by-row-names
+#mri_data_final<-mri_data_final[row.names(mri_data_final) %in% row.names(new_mri_sample),]
+#behavior_complete<-behavior_complete[row.names(behavior_complete) %in% row.names(new_mri_sample),]
+```
+
+We try to first fit the generated brain data and the real behavioral data to the collection of models.
+
+```{r}
+library(MASS)  # Package needed to generate correlated predictors
+library(glmnet)  # Package to fit ridge/lasso/elastic net models
+
+n <- nrow(mri_data_final)  # Number of observations
+#set x and y as our independent and dependent variable matrices
+#normally distibuted matrix
+x <- as.matrix(mri_data_final)/100
+#dimnames(x)<-NULL
+y <- behavior_complete[assess_list]
+set.seed(19873)
+#orig was n = 100, p = 50
+#n <- 100    # Number of observations
+p <- 252     # Number of predictors included in model
+CovMatrix <- outer(1:p, 1:p, function(x,y) {.7^abs(x-y)})
+#x <- mvrnorm(n, rep(0,p), CovMatrix)
+#y <- 10 * apply(x[, 1:2], 1, sum) + 
+ # 5 * apply(x[, 3:4], 1, sum) +
+  #apply(x[, 5:14], 1, sum) +
+  #rnorm(n)
+
+# Split data into train (2/3) and test (1/3) sets
+train_rows <- sample(1:n, .66*n)
+x.train <- as.matrix(x[train_rows, ])
+x.test <- as.matrix(x[-train_rows, ])
+
+y.train <- as.matrix(y[train_rows,])
+y.test <- as.matrix(y[-train_rows,])
+```
+
+```{r}
+dependent_vec_train<-y.train[,1]
+dependent_vec_test<-y.test[,1]
+for (i in 1:length(assess_list)){
+  fit.lasso <- glmnet(x.train, dependent_vec_train, family="gaussian", alpha=1)
+  fit.ridge <- glmnet(x.train, dependent_vec_train, family="gaussian", alpha=0)
+  fit.elnet <- glmnet(x.train, dependent_vec_train, family="gaussian", alpha=0.5)
+}
+
+# 10-fold Cross validation for each alpha = 0, 0.1, ... , 0.9, 1.0
+# (For plots below)
+for (j in 0:10) {
+    assign(paste("fit", j, sep=""), cv.glmnet(x.train,dependent_vec_train,
+                                              type.measure="mse",alpha=j/10,family="gaussian"))
+}
+
+```
+
+# Plot solution path and cross-validated MSE as function of λ.
+
+```{r}
+# Plot solution  paths:
+par(mfrow=c(3,2))
+# For plotting options, type '?plot.glmnet' in R console
+plot(fit.lasso, xvar="lambda")
+plot(fit10, main="LASSO")
+
+plot(fit.ridge, xvar="lambda")
+plot(fit0, main="Ridge")
+
+plot(fit.elnet, xvar="lambda")
+plot(fit5, main="Elastic Net")
+```
+
+The Y axis is the coefficient value, the bottom x-axis is the log lamdba value being tested, and the top x axis is the number of coefficients at that weight that are not zero valued.
+
+# MSE on test set
+```{r}
+yhat0 <- predict(fit0, s=fit0$lambda.min, newx=x.test)
+yhat1 <- predict(fit1, s=fit1$lambda.min, newx=x.test)
+yhat2 <- predict(fit2, s=fit2$lambda.min, newx=x.test)
+yhat3 <- predict(fit3, s=fit3$lambda.min, newx=x.test)
+yhat4 <- predict(fit4, s=fit4$lambda.min, newx=x.test)
+yhat5 <- predict(fit5, s=fit5$lambda.min, newx=x.test)
+yhat6 <- predict(fit6, s=fit6$lambda.min, newx=x.test)
+yhat7 <- predict(fit7, s=fit7$lambda.min, newx=x.test)
+yhat8 <- predict(fit8, s=fit8$lambda.min, newx=x.test)
+yhat9 <- predict(fit9, s=fit9$lambda.min, newx=x.test)
+yhat10 <- predict(fit10, s=fit10$lambda.min, newx=x.test)
+
+mse0 <- mean((dependent_vec_test - yhat0)^2)
+mse1 <- mean((dependent_vec_test - yhat1)^2)
+mse2 <- mean((dependent_vec_test - yhat2)^2)
+mse3 <- mean((dependent_vec_test - yhat3)^2)
+mse4 <- mean((dependent_vec_test - yhat4)^2)
+mse5 <- mean((dependent_vec_test - yhat5)^2)
+mse6 <- mean((dependent_vec_test - yhat6)^2)
+mse7 <- mean((dependent_vec_test - yhat7)^2)
+mse8 <- mean((dependent_vec_test - yhat8)^2)
+mse9 <- mean((dependent_vec_test - yhat9)^2)
+mse10 <- mean((dependent_vec_test - yhat10)^2)
+
+alpha<-rbind(0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1)
+MSE<-rbind(mse0,mse1,mse2,mse3,mse4,mse5,mse6,mse7,mse8,mse9,mse10)
+resultstable<-data.frame(cbind(alpha,MSE))
+colnames(resultstable)<-c("α","MSE")
+rownames(resultstable)<-NULL
+kable(resultstable)
+
+```
+
+Now I try to fit the genetic data to the behavioral data. Here I should be selecting the "best" variables from the brain set, but there's no correlation so none of them are id'd as significant. Here, I'm just playing around. Dosn't work.
+
+```{r}
+library(MASS)  # Package needed to generate correlated predictors
+library(glmnet)  # Package to fit ridge/lasso/elastic net models
+
+n <- nrow(genetics)  # Number of observations
+#set x and y as our independent and dependent variable matrices
+#normally distibuted matrix
+x <- as.data.frame(genetics)
+#remove the columns with NAs
+x<-x[ , apply(x, 2, function(x) !any(is.na(x)))]
+#dimnames(x)<-NULL
+y <- behavior_complete[assess_list]
+set.seed(19873)
+#orig was n = 100, p = 50
+#n <- 100    # Number of observations
+p <- 252     # Number of predictors included in model
+CovMatrix <- outer(1:p, 1:p, function(x,y) {.7^abs(x-y)})
+#x <- mvrnorm(n, rep(0,p), CovMatrix)
+#y <- 10 * apply(x[, 1:2], 1, sum) + 
+ # 5 * apply(x[, 3:4], 1, sum) +
+  #apply(x[, 5:14], 1, sum) +
+  #rnorm(n)
+
+# Split data into train (2/3) and test (1/3) sets
+train_rows <- sample(1:n, .66*n)
+x.train <- as.matrix(x[train_rows, ])
+x.train<-apply(x.train,c(2),as.numeric)
+x.test <- as.matrix(x[-train_rows, ])
+x.test<-apply(x.test,c(2),as.numeric)
+
+y.train <- as.matrix(y[train_rows,])
+y.test <- as.matrix(y[-train_rows,])
+```
+Check the training matrix to see what throws errors
+
+x.train<-apply(x.train,c(2),as.numeric)
+
+
+THAT WAS IT, EVERYTHING WAS JUST CAST AS CHARACTER
+
+
+
+```{r}
+dependent_vec_train<-y.train[,1]
+dependent_vec_test<-y.test[,1]
+for (i in 1:length(assess_list)){
+  fit.lasso <- glmnet(x.train, dependent_vec_train, family="gaussian", alpha=1)
+  fit.ridge <- glmnet(x.train, dependent_vec_train, family="gaussian", alpha=0)
+  fit.elnet <- glmnet(x.train, dependent_vec_train, family="gaussian", alpha=0.5)
+}
+
+# 10-fold Cross validation for each alpha = 0, 0.1, ... , 0.9, 1.0
+# (For plots below)
+for (j in 0:10) {
+    assign(paste("fit", j, sep=""),cv.glmnet(x.train,dependent_vec_train,
+                                              type.measure="mse",alpha=j/10,family="gaussian"))
+}
+
+```
+PLOT
+```{r}
+# Plot solution  paths:
+par(mfrow=c(3,2))
+# For plotting options, type '?plot.glmnet' in R console
+plot(fit.lasso, xvar="lambda")
+plot(fit10, main="LASSO")
+
+plot(fit.ridge, xvar="lambda")
+plot(fit0, main="Ridge")
+
+plot(fit.elnet, xvar="lambda")
+plot(fit5, main="Elastic Net")
+```
+
+```{r}
+yhat0 <- predict(fit0, s=fit0$lambda.min, newx=x.test)
+yhat1 <- predict(fit1, s=fit1$lambda.min, newx=x.test)
+yhat2 <- predict(fit2, s=fit2$lambda.min, newx=x.test)
+yhat3 <- predict(fit3, s=fit3$lambda.min, newx=x.test)
+yhat4 <- predict(fit4, s=fit4$lambda.min, newx=x.test)
+yhat5 <- predict(fit5, s=fit5$lambda.min, newx=x.test)
+yhat6 <- predict(fit6, s=fit6$lambda.min, newx=x.test)
+yhat7 <- predict(fit7, s=fit7$lambda.min, newx=x.test)
+yhat8 <- predict(fit8, s=fit8$lambda.min, newx=x.test)
+yhat9 <- predict(fit9, s=fit9$lambda.min, newx=x.test)
+yhat10 <- predict(fit10, s=fit10$lambda.min, newx=x.test)
+
+mse0 <- mean((dependent_vec_test - yhat0)^2)
+mse1 <- mean((dependent_vec_test - yhat1)^2)
+mse2 <- mean((dependent_vec_test - yhat2)^2)
+mse3 <- mean((dependent_vec_test - yhat3)^2)
+mse4 <- mean((dependent_vec_test - yhat4)^2)
+mse5 <- mean((dependent_vec_test - yhat5)^2)
+mse6 <- mean((dependent_vec_test - yhat6)^2)
+mse7 <- mean((dependent_vec_test - yhat7)^2)
+mse8 <- mean((dependent_vec_test - yhat8)^2)
+mse9 <- mean((dependent_vec_test - yhat9)^2)
+mse10 <- mean((dependent_vec_test - yhat10)^2)
+
+alpha<-rbind(0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1)
+MSE<-rbind(mse0,mse1,mse2,mse3,mse4,mse5,mse6,mse7,mse8,mse9,mse10)
+resultstable<-data.frame(cbind(alpha,MSE))
+colnames(resultstable)<-c("α","MSE")
+rownames(resultstable)<-NULL
+kable(resultstable)
+
+```
+
+```{r}
+
+coef.apprx = coef(fit3, s=fit3$lambda.min, exact = FALSE)
+```
+
